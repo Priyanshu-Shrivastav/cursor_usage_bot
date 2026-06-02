@@ -1,0 +1,102 @@
+name: Cursor Usage Report
+
+on:
+  schedule:
+    # 19:00 IST (GMT+05:30), Mon–Fri — Asia/Kolkata, no DST
+    - cron: "0 19 * * 1-5"
+      timezone: "Asia/Kolkata"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  CURSOR_SESSION_TOKEN: ${{ secrets.CURSOR_SESSION_TOKEN }}
+  CURSOR_USER_ID: ${{ secrets.CURSOR_USER_ID }}
+  GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
+  NEXT_PUBLIC_BASE_URL: http://localhost:3000
+  SCREENSHOT_WIDTH: "2560"
+  SCREENSHOT_SCALE: "4"
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Verify required secrets
+        run: |
+          if [ -z "$CURSOR_SESSION_TOKEN" ]; then
+            echo "::error::Repository secret CURSOR_SESSION_TOKEN is missing."
+            exit 1
+          fi
+          if [ -z "$GOOGLE_CHAT_WEBHOOK" ]; then
+            echo "::error::Repository secret GOOGLE_CHAT_WEBHOOK is missing."
+            exit 1
+          fi
+          echo "Required secrets are present."
+
+      - name: Install dependencies
+        run: npm ci --legacy-peer-deps
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Build app
+        run: npm run build
+
+      - name: Start app and wait for readiness
+        run: |
+          npm run start &
+          echo $! > .next.pid
+          npx wait-on http://localhost:3000 -t 120000
+
+      - name: Capture screenshot
+        run: npm run capture
+
+      - name: Stop app
+        if: always()
+        run: |
+          if [ -f .next.pid ]; then kill "$(cat .next.pid)" || true; fi
+
+      - name: Upload screenshot artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cursor-usage-report
+          path: public/usage-report.png
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish screenshot for Google Chat
+        id: publish_screenshot
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ ! -f public/usage-report.png ]; then
+            echo "::error::public/usage-report.png is missing after capture."
+            exit 1
+          fi
+          if [ -n "${{ secrets.SCREENSHOT_URL }}" ]; then
+            echo "SCREENSHOT_URL=${{ secrets.SCREENSHOT_URL }}" >> "$GITHUB_ENV"
+            echo "Using SCREENSHOT_URL from repository secret."
+          elif URL=$(npx tsx scripts/publishScreenshot.ts); then
+            echo "SCREENSHOT_URL=$URL" >> "$GITHUB_ENV"
+            echo "Published dashboard image: $URL"
+          else
+            echo "::error::Could not publish a public screenshot URL. Google Chat will not be notified (screenshot-only mode)."
+            exit 1
+          fi
+
+      - name: Send report to Google Chat
+        env:
+          SCREENSHOT_URL: ${{ env.SCREENSHOT_URL }}
+        run: npm run report
